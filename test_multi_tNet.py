@@ -20,7 +20,7 @@ from util.config import load_config
 np.set_printoptions(threshold=np.inf)
 from scipy import sparse
 import scipy.sparse as ss
-import scipy.io as sio
+from util.util import calculate_oscr
 def get_evaluation_results(labels_true, labels_pred):
     ACC = metrics.accuracy_score(labels_true, labels_pred)
     F1_macro = metrics.f1_score(labels_true, labels_pred, average='macro')
@@ -28,6 +28,24 @@ def get_evaluation_results(labels_true, labels_pred):
 
     return ACC, F1_macro, F1_micro
 
+def calc_bins(labels_true,preds):
+  # Assign each prediction to a bin
+  num_bins =num_classes
+  bins = np.linspace(0.1, 1, num_bins)
+  binned = np.digitize(preds, bins)
+
+  # Save the accuracy, confidence and size of each bin
+  bin_accs = np.zeros(num_bins)
+  bin_confs = np.zeros(num_bins)
+  bin_sizes = np.zeros(num_bins)
+
+  for bin in range(num_bins):
+    bin_sizes[bin] = len(preds[binned == bin])
+    if bin_sizes[bin] > 0:
+      bin_accs[bin] = (labels_true[binned==bin]).sum() / bin_sizes[bin]
+      bin_confs[bin] = (preds[binned==bin]).sum() / bin_sizes[bin]
+
+  return bins, binned, bin_accs, bin_confs, bin_sizes
 def gather_nd(params, indices):
 
     out_shape = indices.shape[:-1]
@@ -44,7 +62,17 @@ def gather_nd(params, indices):
     out = torch.take(params, idx)
 
     return out.view(out_shape)
+def get_metrics(labels_true,preds):
+  ECE = 0
+  MCE = 0
+  bins, _, bin_accs, bin_confs, bin_sizes = calc_bins(labels_true,preds)
 
+  for i in range(len(bins)):
+    abs_conf_dif = abs(bin_accs[i] - bin_confs[i])
+    ECE += (bin_sizes[i] / sum(bin_sizes)) * abs_conf_dif
+    MCE = max(MCE, abs_conf_dif)
+
+  return ECE, MCE
 def evaluate(logits, mask_indices, show_matrix=False, filter_unseen=True,threshold=None):
 
     if isinstance(logits, list):
@@ -60,8 +88,11 @@ def evaluate(logits, mask_indices, show_matrix=False, filter_unseen=True,thresho
     masked_logits = logits[mask_indices]
     masked_y_pred = torch.argmax(masked_logits, 1)
     masked_y_true = y_true[mask_indices]
+
     if filter_unseen:
         probs = probs[mask_indices]
+
+        # 把所有不不可见类的索引分配新的索引:已知类别最大索引+1
         probs = gather_nd(probs, torch.stack([torch.arange(masked_logits.size(0)), masked_y_pred], axis=1))
         probs = probs.cpu().detach().numpy()
         masked_y_pred = masked_y_pred.numpy()
@@ -79,15 +110,15 @@ def evaluate(logits, mask_indices, show_matrix=False, filter_unseen=True,thresho
     accuracy = accuracy_score(masked_y_true, masked_y_pred)
     macro_f_score = f1_score(masked_y_true, masked_y_pred, average="macro")
 
+
     if show_matrix:
         print(classification_report(masked_y_true, masked_y_pred))
         print(confusion_matrix(masked_y_true, masked_y_pred))
 
     if filter_unseen:
-        return accuracy, macro_f_score, threshold
+        return accuracy, macro_f_score, threshold, probs
     else:
         return accuracy, macro_f_score
-
 def logits_to_probs(logits):
     if args.use_softmax:
         probs = torch.softmax(logits, dim=1)
@@ -295,35 +326,34 @@ def train(args, device, features, labels):
             loss += compute_loss_2(Z_logit, A_list[i], y_true, train_indices)
         loss += compute_loss_0(Z_logit, y_true, train_indices)
         loss += compute_loss_2(Z_logit, alpha, y_true, train_indices)
-        try:
-            loss.backward()
-        except RuntimeError:
-            print("element 0 of tensors does not require grad and does not have a grad_fn\n")
-            break;
-        else:
-            optimizer.step()
-            # scheduler.step(loss)
-            train_accuracy, _ = evaluate(Z_logit.cpu(), train_indices, filter_unseen=False)
-            valid_accuracy, valid_macro_f_score, threshold = evaluate(Z_logit.cpu(), valid_indices, filter_unseen=True)
-            if valid_accuracy >= best_ACC:
-                    best_ACC = valid_accuracy
+        loss.backward()
 
-                    best_model_wts = copy.deepcopy(model.state_dict())
+        optimizer.step()
+        # scheduler.step(loss)
+        train_accuracy, _ = evaluate(Z_logit.cpu(), train_indices, filter_unseen=False)
+        valid_accuracy, valid_macro_f_score, threshold,_ = evaluate(Z_logit.cpu(), valid_indices, filter_unseen=True)
 
-        finally:
+        if valid_accuracy >= best_ACC:
+                best_ACC = valid_accuracy
+                best_model_wts = copy.deepcopy(model.state_dict())
 
-            print("Epoch:", '%04d' % (epoch + 1), "best_acc=", "{:.5f}".format(best_ACC),
-                  "train_loss=", "{:.5f}".format(loss.item()),
-                  "train_acc=", "{:.5f}".format(train_accuracy), "val_acc=", "{:.5f}".format(valid_accuracy),
-                  "threshold=", "{:.5f}".format(threshold), "time=", "{:.5f}".format(time.time() - t))
+        print("Epoch:", '%04d' % (epoch + 1), "best_acc=", "{:.5f}".format(best_ACC),
+              "train_loss=", "{:.5f}".format(loss.item()),
+              "train_acc=", "{:.5f}".format(train_accuracy), "val_acc=", "{:.5f}".format(valid_accuracy),
+              "threshold=", "{:.5f}".format(threshold), "time=", "{:.5f}".format(time.time() - t))
     run_time = time.time() - begin_time
     model.load_state_dict(best_model_wts)
     with torch.no_grad():
         E_list, Z_logit, A_list, alpha = model(features, lap, args.active)
 
-        test_accuracy, test_macro_f_score, _ = evaluate(Z_logit.cpu(), test_indices, show_matrix=False,
+        test_accuracy, test_macro_f_score, _,probs = evaluate(Z_logit.cpu(), test_indices, show_matrix=False,
                                                         filter_unseen=True,
                                                         threshold=threshold)
+        binary_label = torch.where(y_true[test_indices] == args.unseen_label_index, 0, 1).detach().numpy()
+        ECE, MCE = get_metrics(binary_label, probs)
+        scores = logits_to_probs(Z_logit[test_indices])
+        ccr, fpr = calculate_oscr(y_true.cpu().detach().numpy()[test_indices], scores.cpu().detach().numpy(),
+                                  args.unseen_label_index)
 
     if args.save_results:
         with open(args.save_path, "a") as f:
@@ -333,9 +363,10 @@ def train(args, device, features, labels):
                         args.use_hypergraph, args.unseen_num, args.fusion_type, args.active, args.block,
                         args.training_rate, args.alpha, args.beta, args.gamma, args.epoch))
                 f.write("{}:{}\n".format(dataset, dict(
-                    zip(['acc', 'F1_macro', 'time'],
-                        [round(test_accuracy * 100, 2), round(test_macro_f_score * 100, 2), run_time]))))
-
+                    zip(['acc', 'F1_macro', 'ECE', 'MCE', 'time'],
+                        [round(test_accuracy * 100, 2), round(test_macro_f_score * 100, 2), round(ECE * 100, 2), round(MCE * 100, 2), run_time]))))
+                f.write("ccr:{}\n".format(ccr.tolist()))
+                f.write("fpr:{}\n".format(fpr.tolist()))
 def construct_hypergraph(feature_list, knn,device):
     lap = []
     for i in range(n_view):
@@ -457,20 +488,13 @@ if __name__ == '__main__':
             lap=construct_hypergraph(feature_list, knn, device)
         else:
             true_lap, lap = features_to_Lap(dataset,feature_list,device, knn)
-        try:
-            if args.fix_seed:
-                torch.cuda.manual_seed(args.seed)  # 为当前GPU设置随机种子
-                torch.cuda.manual_seed_all(args.seed)  # 为所有GPU设置随机种子
-                random.seed(args.seed)
-                np.random.seed(args.seed)
-                torch.manual_seed(args.seed)
-            train(args, device, features, y_true)
-        except Exception as e:
-            with open(args.save_path, "a") as f:
-                f.write("-----------------")
-            print(e)
-        finally:
-            with open(args.save_path, "a") as f:
-                f.write("\n")
-                continue
+        if args.fix_seed:
+            torch.cuda.manual_seed(args.seed)  # 为当前GPU设置随机种子
+            torch.cuda.manual_seed_all(args.seed)  # 为所有GPU设置随机种子
+            random.seed(args.seed)
+            np.random.seed(args.seed)
+            torch.manual_seed(args.seed)
+        train(args, device, features, y_true)
+        with open(args.save_path, "a") as f:
+            f.write("-----------------")
 
