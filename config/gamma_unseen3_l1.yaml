@@ -1,9 +1,0 @@
-Caltech101all: 0.01
-Hdigit: 0.01
-MITIndoor: 0.01
-MNIST10k: 0.01
-NUSWIDE:  0.01
-scene15: 0.01
-Youtube: 0.01
-smallReuters: 0.01
-NoisyMNIST-30000: 0.001

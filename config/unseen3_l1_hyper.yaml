@@ -1,9 +1,0 @@
-Caltech101all: 3
-Hdigit: 2
-MITIndoor: 1
-MNIST10k: 2
-NUSWIDE: 1
-scene15: 2
-Youtube: 1
-smallReuters: 3
-NoisyMNIST-30000: 2
