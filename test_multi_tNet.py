@@ -1,51 +1,27 @@
 import copy
 import os
+import sys
+from argparse import ArgumentParser
 import warnings
 import time
 import random
 import numpy as np
+import scipy
 import torch
 import torch.nn.functional as F
-from args_tNet import parameter_parser
-from util.loadMatData import load_data, features_to_Lap, features_to_Adj, sparse_mx_to_torch_sparse_tensor, load_data_2
+from util.loadMatData import load_data, features_to_Lap, sparse_mx_to_torch_sparse_tensor
 import scipy.sparse as sp
 from util.label_utils import reassign_labels, special_train_test_split
-from sklearn import metrics
 from sklearn.model_selection import train_test_split
 from TrustworthyNet import TrustworthyNet_classfier
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
-from datasets import construct_H_with_KNN
-import util.hypergraph_utils as hgut
+from sklearn.metrics import accuracy_score, f1_score
+from util.ECE_metrics import get_metrics
 from util.config import load_config
+
 np.set_printoptions(threshold=np.inf)
-from scipy import sparse
-import scipy.sparse as ss
-from util.util import calculate_oscr
-def get_evaluation_results(labels_true, labels_pred):
-    ACC = metrics.accuracy_score(labels_true, labels_pred)
-    F1_macro = metrics.f1_score(labels_true, labels_pred, average='macro')
-    F1_micro = metrics.f1_score(labels_true, labels_pred, average='micro')
 
-    return ACC, F1_macro, F1_micro
 
-def calc_bins(labels_true,preds):
-  # Assign each prediction to a bin
-  num_bins =num_classes
-  bins = np.linspace(0.1, 1, num_bins)
-  binned = np.digitize(preds, bins)
 
-  # Save the accuracy, confidence and size of each bin
-  bin_accs = np.zeros(num_bins)
-  bin_confs = np.zeros(num_bins)
-  bin_sizes = np.zeros(num_bins)
-
-  for bin in range(num_bins):
-    bin_sizes[bin] = len(preds[binned == bin])
-    if bin_sizes[bin] > 0:
-      bin_accs[bin] = (labels_true[binned==bin]).sum() / bin_sizes[bin]
-      bin_confs[bin] = (preds[binned==bin]).sum() / bin_sizes[bin]
-
-  return bins, binned, bin_accs, bin_confs, bin_sizes
 def gather_nd(params, indices):
 
     out_shape = indices.shape[:-1]
@@ -62,19 +38,8 @@ def gather_nd(params, indices):
     out = torch.take(params, idx)
 
     return out.view(out_shape)
-def get_metrics(labels_true,preds):
-  ECE = 0
-  MCE = 0
-  bins, _, bin_accs, bin_confs, bin_sizes = calc_bins(labels_true,preds)
-
-  for i in range(len(bins)):
-    abs_conf_dif = abs(bin_accs[i] - bin_confs[i])
-    ECE += (bin_sizes[i] / sum(bin_sizes)) * abs_conf_dif
-    MCE = max(MCE, abs_conf_dif)
-
-  return ECE, MCE
-def evaluate(logits, mask_indices, show_matrix=False, filter_unseen=True,threshold=None):
-
+#
+def evaluate(logits, mask_indices, uncertainty, filter_unseen=True, threshold=None):
     if isinstance(logits, list):
         logits = logits.mean(0)
         if args.use_softmax:
@@ -84,70 +49,63 @@ def evaluate(logits, mask_indices, show_matrix=False, filter_unseen=True,thresho
         probs = probs_list.mean(0)
     else:
         probs = logits_to_probs(logits)
-
     masked_logits = logits[mask_indices]
     masked_y_pred = torch.argmax(masked_logits, 1)
     masked_y_true = y_true[mask_indices]
-
     if filter_unseen:
-        probs = probs[mask_indices]
-
-        # 把所有不不可见类的索引分配新的索引:已知类别最大索引+1
-        probs = gather_nd(probs, torch.stack([torch.arange(masked_logits.size(0)), masked_y_pred], axis=1))
-        probs = probs.cpu().detach().numpy()
+        uncertainty = uncertainty[mask_indices]
+        # Gather uncertainties for the predicted classes
+        probs= gather_nd(probs, torch.stack([torch.arange(masked_logits.size(0)), masked_y_pred], axis=1))
+        probs= probs.cpu().detach().numpy()
+        uncertainty = uncertainty.cpu().detach().numpy().flatten()
         masked_y_pred = masked_y_pred.numpy()
-        print("mean: ", probs.mean())
-        if threshold is None:
-            threshold = (probs[masked_y_true != args.unseen_label_index].mean()+probs[masked_y_true == args.unseen_label_index].mean())/2.0
-            print("auto meanS: ", threshold)
-        # threshold
-        masked_y_pred[probs < threshold] = args.unseen_label_index
-
+        print("mean uncertainty: ", uncertainty.mean())
+        # Apply threshold to classify samples as unknown if their uncertainty is above the threshold
+        masked_y_pred[uncertainty >= 0.7] = args.unseen_label_index
     else:
         masked_y_pred = masked_y_pred.numpy()
-
-    masked_y_true = masked_y_true
     accuracy = accuracy_score(masked_y_true, masked_y_pred)
     macro_f_score = f1_score(masked_y_true, masked_y_pred, average="macro")
+    return accuracy, macro_f_score, probs
 
-
-    if show_matrix:
-        print(classification_report(masked_y_true, masked_y_pred))
-        print(confusion_matrix(masked_y_true, masked_y_pred))
-
-    if filter_unseen:
-        return accuracy, macro_f_score, threshold, probs
-    else:
-        return accuracy, macro_f_score
 def logits_to_probs(logits):
     if args.use_softmax:
         probs = torch.softmax(logits, dim=1)
-        # probs = F.log_softmax(logits, dim=1)
     else:
         probs = torch.nn.sigmoid(logits)
     return probs
 
-def mse_loss(p, alpha, c):
-    S = torch.sum(alpha, dim=1, keepdim=True) # Dirichlet strength
-    E = alpha - 1 # Evidence
-    m = alpha / S # Confidence
-    # label = F.one_hot(p, num_classes=c)
-    A = torch.sum((p - m) ** 2, dim=1, keepdim=True)
-    B = torch.sum(alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True)
-    alp = E * (1 - p) + 1
-    C = KL(alp, c)
-    return (A + B) + C
+def compute_loss(outputs, labels, mask_indices):
 
-def KL(alpha, c):
-    beta = torch.ones((1, c)).to(device)
-    S_alpha = torch.sum(alpha, dim=1, keepdim=True)
-    S_beta = torch.sum(beta, dim=1, keepdim=True)
-    lnB = torch.lgamma(S_alpha) - torch.sum(torch.lgamma(alpha), dim=1, keepdim=True)
-    lnB_uni = torch.sum(torch.lgamma(beta), dim=1, keepdim=True) - torch.lgamma(S_beta)
-    dg0 = torch.digamma(S_alpha)
-    dg1 = torch.digamma(alpha)
-    kl = torch.sum((alpha - beta) * (dg1 - dg0), dim=1, keepdim=True) + lnB + lnB_uni
-    return kl
+    logits = outputs
+    labels = labels.long()
+    all_indices = np.arange(0, logits.size(0))
+    unmasked_indices = np.delete(all_indices, mask_indices)
+    unmasked_logits = logits[unmasked_indices]
+
+    unmasked_probs = logits_to_probs(unmasked_logits)
+    unmasked_probs = torch.clamp(unmasked_probs, 1e-7, 1.0)
+    unmasked_preds = torch.argmax(unmasked_probs, 1).to(device)
+    unmasked_prob = gather_nd(unmasked_probs, torch.stack([torch.arange(unmasked_logits.size(0)).to(device), unmasked_preds], axis=1))
+
+    topk_indices_a = torch.logical_and(torch.greater(unmasked_prob, 1.0 / num_classes), torch.less(unmasked_prob, 0.5))
+    topk_indices_b = torch.arange(topk_indices_a.size(0)).to(device)
+    topk_indices = torch.masked_select(topk_indices_b, topk_indices_a)
+
+    unmasked_probs = unmasked_probs[topk_indices]
+    loss_unseen = (unmasked_probs * torch.log(unmasked_probs)).mean()
+
+    #####################################################################################
+
+    logits = F.log_softmax(logits, dim=1)
+    masked_logits = logits[mask_indices]
+    masked_y_true = labels[mask_indices].to(device)
+    loss_seen = torch.nn.NLLLoss()(masked_logits, masked_y_true)
+    #####################################################################################
+
+    return loss_seen + loss_unseen
+
+#########################################################################################################################################################################
 
 def ce_loss(p, alpha, c):
     S = torch.sum(alpha, dim=1, keepdim=True)
@@ -173,101 +131,16 @@ def ce_loss_1(p, alpha, c):
     B = KL(alp, c)
 
     return (A + B)
-
-def compute_loss_0(outputs, labels, mask_indices):
-
-    logits = outputs
-    labels = labels.long()
-
-##################################################
-
-    all_indices = np.arange(0, logits.size(0))
-    unmasked_indices = np.delete(all_indices, mask_indices)
-    unmasked_logits = logits[unmasked_indices]
-
-    unmasked_probs = logits_to_probs(unmasked_logits)
-    unmasked_probs = torch.clamp(unmasked_probs, 1e-7, 1.0)
-    unmasked_preds = torch.argmax(unmasked_probs, 1).to(device)
-    unmasked_prob = gather_nd(unmasked_probs, torch.stack([torch.arange(unmasked_logits.size(0)).to(device), unmasked_preds], axis=1))
-
-    topk_indices_a = torch.logical_and(torch.greater(unmasked_prob, 1.0 / num_classes), torch.less(unmasked_prob, 0.5))
-    topk_indices_b = torch.arange(topk_indices_a.size(0)).to(device)
-    topk_indices = torch.masked_select(topk_indices_b, topk_indices_a)
-
-    unmasked_probs = unmasked_probs[topk_indices]
-    loss_unseen = (unmasked_probs * torch.log(unmasked_probs)).mean()
-
-    #####################################################################################
-
-    logits = F.log_softmax(logits, dim=1)
-    masked_logits = logits[mask_indices]
-    masked_y_true = labels[mask_indices].to(device)
-    # h = F.one_hot(masked_y_true, num_classes)
-    loss_seen = torch.nn.NLLLoss()(masked_logits, masked_y_true)
-    #####################################################################################
-
-    loss = args.alpha_1 * loss_seen + args.beta_1 * loss_unseen
-
-
-
-    return loss
-
-def compute_loss(outputs, alpha, labels, mask_indices):
-
-    logits = alpha
-    labels = labels.long()
-
-    ##################################################
-
-    all_indices = np.arange(0, logits.size(0))
-    unmasked_indices = np.delete(all_indices, mask_indices)
-    unmasked_logits = logits[unmasked_indices]
-
-    unmasked_probs = logits_to_probs(unmasked_logits)
-    unmasked_probs = torch.clamp(unmasked_probs, 1e-7, 1.0)
-    unmasked_preds = torch.argmax(unmasked_probs, 1).to(device)
-    unmasked_prob = gather_nd(unmasked_probs, torch.stack([torch.arange(unmasked_logits.size(0)).to(device), unmasked_preds], axis=1))
-
-    topk_indices_a = torch.logical_and(torch.greater(unmasked_prob, 1.0 / num_classes), torch.less(unmasked_prob, 0.5))
-    topk_indices_b = torch.arange(topk_indices_a.size(0)).to(device)
-    topk_indices = torch.masked_select(topk_indices_b, topk_indices_a)
-
-    unmasked_probs = unmasked_probs[topk_indices]
-    loss_unseen = ce_loss(unmasked_preds[topk_indices], unmasked_probs, num_classes).mean()
-
-    #################################################################################
-
-    masked_logits = logits[mask_indices]
-    masked_y_true = labels[mask_indices].to(device)
-    loss_seen = ce_loss(masked_y_true, masked_logits, num_classes).mean()
-    #####################################################################################
-
-    loss = args.alpha * loss_seen + args.beta * loss_unseen
-
-    return loss
-def compute_loss_1(outputs, alpha, labels, mask_indices):
-
-    logits = alpha
-    labels = labels.long()
-
-    ##################################################
-
-    all_indices = np.arange(0, logits.size(0))
-    unmasked_indices = np.delete(all_indices, mask_indices)
-    unmasked_logits = logits[unmasked_indices]
-    unmasked_preds = torch.argmax(unmasked_logits, 1).to(device)
-    loss_unseen = ce_loss_1(unmasked_preds, unmasked_logits, num_classes).mean()
-
-    #####################################################################################
-
-    masked_logits = logits[mask_indices]
-    masked_y_true = labels[mask_indices].to(device)
-    loss_seen = ce_loss(masked_y_true, masked_logits, num_classes).mean()
-    #####################################################################################
-
-    loss = args.alpha * loss_seen + args.beta * loss_unseen
-
-    return loss
+def KL(alpha, c):
+    beta = torch.ones((1, c)).to(device)
+    S_alpha = torch.sum(alpha, dim=1, keepdim=True)
+    S_beta = torch.sum(beta, dim=1, keepdim=True)
+    lnB = torch.lgamma(S_alpha) - torch.sum(torch.lgamma(alpha), dim=1, keepdim=True)
+    lnB_uni = torch.sum(torch.lgamma(beta), dim=1, keepdim=True) - torch.lgamma(S_beta)
+    dg0 = torch.digamma(S_alpha)
+    dg1 = torch.digamma(alpha)
+    kl = torch.sum((alpha - beta) * (dg1 - dg0), dim=1, keepdim=True) + lnB + lnB_uni
+    return kl
 
 def compute_loss_2(outputs, alpha, labels, mask_indices):
 
@@ -299,99 +172,98 @@ def compute_loss_2(outputs, alpha, labels, mask_indices):
     loss_seen = ce_loss(masked_y_true, masked_logits, num_classes).mean()
     #####################################################################################
 
-    loss = args.alpha * loss_seen + args.beta * loss_unseen
-
-    return loss
-#########################################################################################################################################################################
-
-
-#########################################################################################################################################################################
-#########################################################################################################################################################################
-
+    return (loss_seen+loss_unseen)/len(train_indices)
 def train(args, device, features, labels):
-    print(
-        "use_hypergraph:{}, unseen_num:{},fusion:{}, active:{}, block:{}, training_rate:{}, alpha:{}, beta:{}, gamma:{}, epoch:{} \n".format(
-            args.use_hypergraph, args.unseen_num, args.fusion_type, args.active, args.block, args.training_rate,
-            args.alpha, args.beta, args.gamma, args.epoch))
-    model = TrustworthyNet_classfier(n_feats, n_view, num_classes, n, args, device).to(device)
+
+
+    model = TrustworthyNet_classfier(n_feats, n_view, num_classes, n, args,device).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
     best_ACC = 0
+    loss_list = []
+    acc_list = []
+    f1_macro_list = []
     begin_time = time.time()
     for epoch in range(args.epoch):
         t = time.time()
-        E_list, Z_logit, A_list, alpha = model(features, lap, args.active)
+        Z_logit, A_list, alpha, u = model(features, lap, args.active)
         optimizer.zero_grad()
-        loss = 0
+        # loss =compute_loss(Z_logit, y_true, train_indices)
+        loss =10000* compute_loss(Z_logit, y_true, train_indices)
+
+        loss += args.lambda1*compute_loss_2(Z_logit, alpha, y_true, train_indices)
         for i in range(n_view):
-            loss += compute_loss_2(Z_logit, A_list[i], y_true, train_indices)
-        loss += compute_loss_0(Z_logit, y_true, train_indices)
-        loss += compute_loss_2(Z_logit, alpha, y_true, train_indices)
+            loss += args.lambda2*compute_loss_2(Z_logit, A_list[i], y_true, train_indices)
         loss.backward()
-
         optimizer.step()
-        # scheduler.step(loss)
-        train_accuracy, _ = evaluate(Z_logit.cpu(), train_indices, filter_unseen=False)
-        valid_accuracy, valid_macro_f_score, threshold,_ = evaluate(Z_logit.cpu(), valid_indices, filter_unseen=True)
-
-        if valid_accuracy >= best_ACC:
+        loss_list.append(loss.item())
+        with torch.no_grad():
+            Z_logit, A_list, alpha, u = model(features, lap, args.active)
+            valid_accuracy, valid_macro_f_score, _= evaluate(Z_logit.cpu(), valid_indices,u, filter_unseen=True)
+            if valid_accuracy >= best_ACC:
                 best_ACC = valid_accuracy
+
                 best_model_wts = copy.deepcopy(model.state_dict())
 
         print("Epoch:", '%04d' % (epoch + 1), "best_acc=", "{:.5f}".format(best_ACC),
-              "train_loss=", "{:.5f}".format(loss.item()),
-              "train_acc=", "{:.5f}".format(train_accuracy), "val_acc=", "{:.5f}".format(valid_accuracy),
-              "threshold=", "{:.5f}".format(threshold), "time=", "{:.5f}".format(time.time() - t))
-    run_time = time.time() - begin_time
+                  "train_loss=", "{:.5f}".format(loss),"val_acc=", "{:.5f}".format(valid_accuracy), "time=", "{:.5f}".format(time.time() - t))
+
     model.load_state_dict(best_model_wts)
     with torch.no_grad():
-        E_list, Z_logit, A_list, alpha = model(features, lap, args.active)
-
-        test_accuracy, test_macro_f_score, _,probs = evaluate(Z_logit.cpu(), test_indices, show_matrix=False,
-                                                        filter_unseen=True,
-                                                        threshold=threshold)
+        Z_logit, A_list, alpha,u = model(features, lap, args.active)
+        test_accuracy, test_macro_f_score, probs = evaluate(Z_logit.cpu(), test_indices, u )
         binary_label = torch.where(y_true[test_indices] == args.unseen_label_index, 0, 1).detach().numpy()
         ECE, MCE = get_metrics(binary_label, probs)
-        scores = logits_to_probs(Z_logit[test_indices])
-        ccr, fpr = calculate_oscr(y_true.cpu().detach().numpy()[test_indices], scores.cpu().detach().numpy(),
-                                  args.unseen_label_index)
 
+
+    run_time=time.time()-begin_time
     if args.save_results:
-        with open(args.save_path, "a") as f:
-            with open(args.save_path, "a") as f:
-                f.write(
-                    "use_hypergraph:{}, unseen_num:{},fusion:{}, active:{}, block:{}, training_rate:{}, alpha:{}, beta:{}, gamma:{}, epoch:{} \n".format(
-                        args.use_hypergraph, args.unseen_num, args.fusion_type, args.active, args.block,
-                        args.training_rate, args.alpha, args.beta, args.gamma, args.epoch))
-                f.write("{}:{}\n".format(dataset, dict(
-                    zip(['acc', 'F1_macro', 'ECE', 'MCE', 'time'],
-                        [round(test_accuracy * 100, 2), round(test_macro_f_score * 100, 2), round(ECE * 100, 2), round(MCE * 100, 2), run_time]))))
-                f.write("ccr:{}\n".format(ccr.tolist()))
-                f.write("fpr:{}\n".format(fpr.tolist()))
-def construct_hypergraph(feature_list, knn,device):
-    lap = []
-    for i in range(n_view):
-        direction_judge = '../hyperlap_matrix/' + dataset + '/' + 'v' + str(i) + '_knn' + str(knn) + '_hyperlap.npz'
-        if os.path.exists(direction_judge):
-            print("Loading the hyperlap matrix of " + str(i) + "th view of " + dataset)
-            temp_lap = ss.load_npz(direction_judge)
-            lap.append(torch.from_numpy(temp_lap.todense()).float().to(device))
+        with open(args.file, "a") as f:
+            f.write(f"unseen_num:{args.unseen_num}, blocks:{args.block}, gamma:{args.alpha}.lambda1:{args.lambda1}, lambda2:{args.lambda2},knn:{knn}\n")
+            f.write("{}:{}\n".format(data, dict(
+                zip(['acc', 'F1_macro', 'ECE', 'MCE','time'], [round(test_accuracy * 100, 2),
+                                                               round(test_macro_f_score * 100, 2),
+                                                               round(ECE * 100, 2),
+                                                               round(MCE * 100, 2), run_time]))))
 
-        else:
+## Parameter setting
+def parameter_parser():
+    parser = ArgumentParser()
 
-            print("Constructing the hyperlap matrix of " + str(i) + "th view of " + dataset)
+    current_dir = sys.path[0]
+    parser.add_argument("--path", type=str, default=current_dir)
 
-            H = construct_H_with_KNN([feature_list[i]], knn, split_diff_scale=True)
-            G = hgut.generate_G_from_H(H)
-            temp_lap = np.identity(len(G)) - G
-            save_direction = '../hyperlap_matrix/' + dataset + '/'
-            if not os.path.exists(save_direction):
-                os.makedirs(save_direction)
+    parser.add_argument("--data_path", type=str, default="/data/", help="Path of datasets.")
+    parser.add_argument("--file", type=str, default="./result.txt", help="Path of datasets.")
 
-            print("Saving the adjacency matrix to " + save_direction)
-            ss.save_npz(save_direction + 'v' + str(i) + '_knn' + str(knn) + '_hyperlap.npz', sparse.csr_matrix(temp_lap[0]))
+    # input_type； choose features or similarity graphs to learn a multi-variate heterogeneous representation.
+    parser.add_argument("--save_results", action='store_true', default=True, help="Save experimental result.")
+    parser.add_argument("--use_softmax", action='store_true', default=True)
+    parser.add_argument("--resp", type=int, default=1)
+    parser.add_argument("--unseen_label_index", type=int, default=-100)
+    parser.add_argument("--fusion_type", type=str, default="trust",
+                        help="Fusion Methods: trust average weight attention")
 
-            lap.append(torch.from_numpy(temp_lap[0]).to(torch.float32).to(device))
-    return lap
+    parser.add_argument("--active", type=str, default="l1", help="l21 or l1")
+    # the type of regularizer with Prox_h()
+
+    parser.add_argument("--device", default="0", type=str, required=False)
+    parser.add_argument("--fix_seed", action='store_true', default=True, help="")
+    parser.add_argument("--seed", type=int, default=40, help="Random seed, default is 42.")
+    parser.add_argument('--no-cuda', action='store_true', default=True, help='Disables CUDA training.')
+    parser.add_argument("--training_rate", type=float, default=0.1, help="Number of labeled samples per classes")
+    parser.add_argument("--valid_rate", type=float, default=0.1, help="Number of labeled samples per classes")
+    parser.add_argument("--weight_decay", type=float, default=0.15, help="Weight decay")
+    parser.add_argument("--in_size", type=int, default=102)
+
+    parser.add_argument('--epoch', type=int, default=300, help='Number of epochs to train.')
+    parser.add_argument('--unseen_num', type=int, default=1)
+    parser.add_argument('--alpha', type=float, default=1)
+    parser.add_argument('--lr', type=float, default=0.01, help='Initial learning rate.')
+    parser.add_argument('--block', type=int, default=1,
+                        help='block')  # for the example dataset, block can set 2 and more than 2
+    parser.add_argument('--thre', type=float, default=0.1)
+    return parser.parse_args()
 
 
 def sparse_to_tuple(sparse_mx):
@@ -401,100 +273,72 @@ def sparse_to_tuple(sparse_mx):
     values = sparse_mx.data
     shape = sparse_mx.shape
     return coords, values, shape
-
-
 if __name__ == '__main__':
     warnings.filterwarnings('ignore')
     args = parameter_parser()
+    args.device = '0'
     device = torch.device('cpu' if args.device == 'cpu' else 'cuda:' + args.device)
 
+
     dataset_dict = {1:  'Caltech101all',  2: 'Hdigit',3: 'MITIndoor', 4: 'MNIST10k',
-               5: 'NoisyMNIST_30000', 6: 'NUSWIDE',
+               5: 'NoisyMNIST_30000', 6: "NUSWide20k",
                7: 'scene15', 8: 'Youtube'}
-
-    select_dataset = [2]
-
+    select_dataset = [1,2,3,4,5,6,7,8]
 
     for ii in select_dataset:
-        dataset=dataset_dict[ii]
-        if args.use_hypergraph:
-            config = load_config('./config/unseen'+str(args.unseen_num)+'_'+args.active+'_hyper.yaml')
-            config2 = load_config('./config/gamma_unseen' + str(args.unseen_num) + '_' + args.active + '_hyper.yaml')
-        else:
-            config = load_config('./config/unseen' + str(args.unseen_num) + '_' + args.active + '.yaml')
-            config2= load_config('./config/gamma_unseen' + str(args.unseen_num) + '_' + args.active + '.yaml')
-
-        args.block=config[dataset]
-        args.gamma=config2[dataset]
-        if args.fix_seed:
-            torch.cuda.manual_seed(args.seed)  # 为当前GPU设置随机种子
-            torch.cuda.manual_seed_all(args.seed)  # 为所有GPU设置随机种子
-            random.seed(args.seed)
-            np.random.seed(args.seed)
-            torch.manual_seed(args.seed)
-
-        print("========================", dataset)
-        features, labels= load_data_2(dataset, args.data_path)
-        labels = labels + 1
-
-
+        data = dataset_dict[ii]
+        print("========================", data)
+        features, labels= load_data(dataset_dict[ii], '../data/')
+        config = load_config(f'./config/{data}.yaml')
+        args.alpha=config['alpha']
         n_view = len(features)
         n_feats = [x.shape[1] for x in features]
         n = features[0].shape[0]
         n_classes = len(np.unique(labels))
+
+
+        # open2 = (1 - openness) * (1 - openness)
+        # args.unseen_num = round((1 - open2 / (2 - open2)) * n_classes)
+        print("unseen_num:%d" % args.unseen_num)
+
 
         feature_list = []
         for i in range(n_view):
             feature_list.append(features[i])
             features[i] = torch.from_numpy(features[i] / 1.0).float().to(device)
 
-        if args.unseen_num == 1:
-            original_num_classes = np.max(labels) + 1
-        elif args.unseen_num != 1:
-            original_num_classes = np.max(labels) + 1
-
-        seen_labels = list(range(1, original_num_classes - args.unseen_num))
+        original_num_classes = np.max(labels) + 1
+        seen_labels = list(range(original_num_classes -args.unseen_num))
         y_true = reassign_labels(labels, seen_labels, args.unseen_label_index)
-        for i in range(len(y_true)):
-            if y_true[i]!=-100:
-                y_true[i] = y_true[i]+1
-
 
         train_indices, test_valid_indices = special_train_test_split(y_true, args.unseen_label_index,
                                                                      test_size=1 - args.training_rate)
         test_indices, valid_indices = train_test_split(test_valid_indices, test_size=args.valid_rate / (1 - args.training_rate))
 
 
-        if args.unseen_num == 1:
-            num_classes = np.max(y_true) + 1
-        elif args.unseen_num != 1:
-            num_classes = np.max(y_true) + 1
-
+        num_classes = np.max(y_true) + 1
         y_true = torch.from_numpy(y_true)
-        print('data:{}\tseen_labels:{}\tuse_softmax:{}\trandom_seed:{}\tunseen_num:{}\tnum_classes:{}'.format(
-            dataset,
+        print('data:{}\tseen_labels:{}\tuse_softmax:{}\t\tunseen_num:{}\tnum_classes:{}'.format(
+            dataset_dict[ii],
             seen_labels,
             args.use_softmax,
-            args.seed,
             args.unseen_num,
             num_classes))
 
-        print(dataset, n, n_view, n_feats,n_classes)
+        print(data, n, n_view, n_feats,n_classes)
         labels = torch.from_numpy(labels).long().to(device)
 
-        knn = int(n/n_classes)
+        knn = int(n/n_classes*0.5)
+        lap = features_to_Lap(feature_list, knn)
 
-        if args.use_hypergraph:
-            lap=construct_hypergraph(feature_list, knn, device)
-        else:
-            true_lap, lap = features_to_Lap(dataset,feature_list,device, knn)
+        for i in range(n_view):
+            lap[i] = lap[i].to_dense().to(device)
         if args.fix_seed:
-            torch.cuda.manual_seed(args.seed)  # 为当前GPU设置随机种子
-            torch.cuda.manual_seed_all(args.seed)  # 为所有GPU设置随机种子
-            random.seed(args.seed)
-            np.random.seed(args.seed)
-            torch.manual_seed(args.seed)
-        train(args, device, features, y_true)
-        with open(args.save_path, "a") as f:
-            f.write("-----------------")
+            seed = 20
+            torch.cuda.manual_seed(seed)  # 为当前GPU设置随机种子
+            torch.cuda.manual_seed_all(seed)  # 为所有GPU设置随机种子
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+        train(args, device, features, labels)
 
