@@ -1,3 +1,0 @@
-use_hypergraph:True, unseen_num:1,fusion:trust, active:l1, block:2, training_rate:0.1, alpha:0.1, beta:0.1, gamma:0.001, epoch:500 
-Hdigit:{'acc': 92.2, 'F1_macro': 92.88, 'time': 139.02164483070374}
-
