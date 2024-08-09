@@ -277,13 +277,6 @@ def sparse_to_tuple(sparse_mx):
 if __name__ == '__main__':
     warnings.filterwarnings('ignore')
     args = parameter_parser()
-    if args.fix_seed:
-        seed = 20
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
     args.device = '0'
 
     args.lambda1 = 1
@@ -297,6 +290,13 @@ if __name__ == '__main__':
                7: 'scene15', 8: 'Youtube'}
     select_dataset = [8]
     for ii in select_dataset:
+        if args.fix_seed:
+            seed = 20
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
         data = dataset_dict[ii]
         print("========================", data)
         features, labels= load_data(dataset_dict[ii], './data/')
