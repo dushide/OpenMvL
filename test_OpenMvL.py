@@ -288,7 +288,7 @@ if __name__ == '__main__':
     dataset_dict = {1:  'Caltech101-all',  2: 'Hdigit',3: 'MITIndoor', 4: 'MNIST10k',
                5: 'NoisyMNIST-30000', 6: "NUSWide20k",
                7: 'scene15', 8: 'Youtube'}
-    select_dataset = [8]
+    select_dataset = [7]
     for ii in select_dataset:
         if args.fix_seed:
             seed = 20
