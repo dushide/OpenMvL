@@ -276,19 +276,30 @@ def sparse_to_tuple(sparse_mx):
 if __name__ == '__main__':
     warnings.filterwarnings('ignore')
     args = parameter_parser()
+    if args.fix_seed:
+        seed = 20
+        torch.cuda.manual_seed(seed)  # 为当前GPU设置随机种子
+        torch.cuda.manual_seed_all(seed)  # 为所有GPU设置随机种子
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
     args.device = '0'
+
+    args.lambda1 = 1
+    args.lambda2 =1
+
     device = torch.device('cpu' if args.device == 'cpu' else 'cuda:' + args.device)
 
 
     dataset_dict = {1:  'Caltech101all',  2: 'Hdigit',3: 'MITIndoor', 4: 'MNIST10k',
                5: 'NoisyMNIST_30000', 6: "NUSWide20k",
                7: 'scene15', 8: 'Youtube'}
-    select_dataset = [1,2,3,4,5,6,7,8]
+    select_dataset = [8]
 
     for ii in select_dataset:
         data = dataset_dict[ii]
         print("========================", data)
-        features, labels= load_data(dataset_dict[ii], '../data/')
+        features, labels= load_data(dataset_dict[ii], './data/')
         config = load_config(f'./config/{data}.yaml')
         args.alpha=config['alpha']
         n_view = len(features)
@@ -333,12 +344,6 @@ if __name__ == '__main__':
 
         for i in range(n_view):
             lap[i] = lap[i].to_dense().to(device)
-        if args.fix_seed:
-            seed = 20
-            torch.cuda.manual_seed(seed)  # 为当前GPU设置随机种子
-            torch.cuda.manual_seed_all(seed)  # 为所有GPU设置随机种子
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
+
         train(args, device, features, labels)
 
