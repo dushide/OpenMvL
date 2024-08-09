@@ -250,7 +250,7 @@ def parameter_parser():
     parser.add_argument("--device", default="0", type=str, required=False)
     parser.add_argument("--fix_seed", action='store_true', default=True, help="")
     parser.add_argument("--seed", type=int, default=40, help="Random seed, default is 42.")
-    parser.add_argument("--hp", type=int, default=10000, help="training number, default is 1.")
+    parser.add_argument("--hp", type=int, default=10, help="training hyper-number, default is 1.")
     parser.add_argument('--no-cuda', action='store_true', default=True, help='Disables CUDA training.')
     parser.add_argument("--training_rate", type=float, default=0.1, help="Number of labeled samples per classes")
     parser.add_argument("--valid_rate", type=float, default=0.1, help="Number of labeled samples per classes")
