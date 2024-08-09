@@ -250,6 +250,7 @@ def parameter_parser():
     parser.add_argument("--device", default="0", type=str, required=False)
     parser.add_argument("--fix_seed", action='store_true', default=True, help="")
     parser.add_argument("--seed", type=int, default=40, help="Random seed, default is 42.")
+    parser.add_argument("--hp", type=int, default=10000, help="training number, default is 1.")
     parser.add_argument('--no-cuda', action='store_true', default=True, help='Disables CUDA training.')
     parser.add_argument("--training_rate", type=float, default=0.1, help="Number of labeled samples per classes")
     parser.add_argument("--valid_rate", type=float, default=0.1, help="Number of labeled samples per classes")
@@ -278,24 +279,23 @@ if __name__ == '__main__':
     args = parameter_parser()
     if args.fix_seed:
         seed = 20
-        torch.cuda.manual_seed(seed)  # 为当前GPU设置随机种子
-        torch.cuda.manual_seed_all(seed)  # 为所有GPU设置随机种子
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
     args.device = '0'
 
     args.lambda1 = 1
-    args.lambda2 =1
+    args.lambda2 = 1
 
     device = torch.device('cpu' if args.device == 'cpu' else 'cuda:' + args.device)
 
 
-    dataset_dict = {1:  'Caltech101all',  2: 'Hdigit',3: 'MITIndoor', 4: 'MNIST10k',
-               5: 'NoisyMNIST_30000', 6: "NUSWide20k",
+    dataset_dict = {1:  'Caltech101-all',  2: 'Hdigit',3: 'MITIndoor', 4: 'MNIST10k',
+               5: 'NoisyMNIST-30000', 6: "NUSWide20k",
                7: 'scene15', 8: 'Youtube'}
     select_dataset = [8]
-    args.hp = 10000
     for ii in select_dataset:
         data = dataset_dict[ii]
         print("========================", data)
