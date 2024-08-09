@@ -189,7 +189,7 @@ def train(args, device, features, labels):
         Z_logit, A_list, alpha, u = model(features, lap, args.active)
         optimizer.zero_grad()
         # loss =compute_loss(Z_logit, y_true, train_indices)
-        loss =10000* compute_loss(Z_logit, y_true, train_indices)
+        loss =args.hp* compute_loss(Z_logit, y_true, train_indices)
 
         loss += args.lambda1*compute_loss_2(Z_logit, alpha, y_true, train_indices)
         for i in range(n_view):
@@ -295,7 +295,7 @@ if __name__ == '__main__':
                5: 'NoisyMNIST_30000', 6: "NUSWide20k",
                7: 'scene15', 8: 'Youtube'}
     select_dataset = [8]
-
+    args.hp = 10000
     for ii in select_dataset:
         data = dataset_dict[ii]
         print("========================", data)
