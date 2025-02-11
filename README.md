@@ -1,5 +1,5 @@
 
-## OpenViewer
+## OpenMvL
 OpenMvL is a framework for open-set multi-view learning that integrates view-specific attributes, dynamic uncertainty estimation, and evidential fusion. This repository contains the code and datasets used for the experiments in our paper.
 
 ### Installation
